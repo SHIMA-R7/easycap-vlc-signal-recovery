@@ -1,0 +1,14 @@
+# Default deny: publish only our source, documentation and generated text patch.
+*
+!.gitignore
+!.gitattributes
+!Capture-EasyCAP.ps1
+!Open-EasyCAP.cs
+!EasyCAP-Bridge.cs
+!Build-EasyCAP.ps1
+!Open-EasyCAP.cmd
+!Record-EasyCAP.cmd
+!README.md
+!TESTING.md
+!patches/
+!patches/signal-recovery.patch

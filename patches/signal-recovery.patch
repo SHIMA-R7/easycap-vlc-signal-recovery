@@ -1,0 +1,337 @@
+--- a/Capture-EasyCAP.ps1
++++ b/Capture-EasyCAP.ps1
+@@ -1,4 +1,22 @@
+-﻿param([switch]$Preview, [int]$Seconds = 6, [string]$AudioDevice = '', [string]$RecordingPath = '')
++﻿param(
++    [switch]$Preview,
++    [ValidateSet('DirectShow','FFmpeg')][string]$Backend = 'FFmpeg',
++    [ValidateRange(1,86400)][int]$Seconds = 6,
++    [string]$AudioDevice = '',
++    [string]$RecordingPath = '',
++    [ValidateRange(100,3000)][int]$CacheMs = 0,
++    [switch]$Snapshots,
++    [ValidateRange(0,3)][double]$Saturation = 1.25,
++    [ValidateRange(0,2)][double]$Contrast = 0.95,
++    [ValidateRange(0,2)][double]$Brightness = 0.993,
++    [ValidateRange(0.01,10)][double]$Gamma = 0.76,
++    [ValidateRange(-180,180)][double]$Hue = 0,
++    [switch]$Denoise,
++    [switch]$EnhanceColor = $true,
++    [switch]$NoDenoise,
++    [switch]$NaturalColor,
++    [switch]$DryRun
++)
+ $ErrorActionPreference = 'Stop'
+ $vlcCandidates = @(
+     (Join-Path ${env:ProgramFiles(x86)} 'VideoLAN\VLC\vlc.exe'),
+@@ -21,37 +39,127 @@
+     }
+     if (-not $AudioDevice) { throw 'EasyCAP audio input not found. Connect EasyCAP or specify -AudioDevice.' }
+ }
+-Write-Host "EasyCAP audio input: $AudioDevice"
++# VLC 3.0.12 has no dshow-audio-buffer-size option (allocator requests 100ms).
++# Keep clock synchronization enabled. Do not cap jitter during baseline diagnosis.
++if ($CacheMs -eq 0) { if ($RecordingPath) { $CacheMs = 500 } else { $CacheMs = 300 } }
++if ($RecordingPath) {
++    $RecordingPath = [IO.Path]::GetFullPath($RecordingPath)
++    $extension = [IO.Path]::GetExtension($RecordingPath)
++    if ($Backend -eq 'FFmpeg' -and $extension -ne '.mkv') { throw 'FFmpeg capture requires a .mkv recording path (original MJPEG video / PCM audio).' }
++    if ($Backend -eq 'DirectShow' -and $extension -ne '.ts') { throw 'DirectShow recording requires a .ts recording path.' }
++    if ($RecordingPath.Contains("'")) { throw 'Recording path must not contain an apostrophe.' }
++    if (Test-Path -LiteralPath $RecordingPath) { throw 'Recording file already exists.' }
++    if (-not $DryRun) { New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($RecordingPath)) | Out-Null }
++}
+ $frames = Join-Path $PSScriptRoot 'frames'
+-New-Item -ItemType Directory -Path $frames -Force | Out-Null
+-$vlcArgs = @('--no-one-instance','--no-qt-updates-notif','--live-caching=50','--no-audio-time-stretch','--no-video-title-show','--avcodec-hw=none','--video-filter=scene','--scene-format=png','--scene-ratio=25','--scene-prefix=easycap','--scene-replace',"--scene-path=$frames",'--verbose=2','--file-logging',"--logfile=$PSScriptRoot\capture.log")
+-if ($Preview) { $vlcArgs += @('--meta-title=EasyCAP','--no-fullscreen','--no-qt-video-autoresize','--width=480','--height=360','--zoom=0.666667','--audio','--volume=180') }
+-else { $vlcArgs += @('--no-audio','-I','dummy','--vout=dummy',"--run-time=$Seconds") }
+-$vlcArgs += @('dshow://',':dshow-vdev=AV TO USB2.0',":dshow-adev=$AudioDevice",':dshow-audio-buffer-size=50',':dshow-video-standard=1',':dshow-size=720x480',':dshow-aspect-ratio=4:3')
++$takeSnapshots = $Snapshots -or (-not $Preview -and -not $RecordingPath)
++# Separate logs prevent appended sessions and simultaneous runs from being confused.
++$runId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), $PID
++$log = Join-Path $PSScriptRoot "capture-$runId.log"
++$vlcArgs = @('--ignore-config','--no-one-instance','--no-qt-updates-notif',
++    "--live-caching=$CacheMs",'--clock-synchro=-1',
++    '--audio-time-stretch','--no-video-title-show','--avcodec-hw=none',
++    '--verbose=2','--file-logging',"--logfile=$log")
++if ($takeSnapshots) {
++    if (-not $DryRun) { New-Item -ItemType Directory -Path $frames -Force | Out-Null }
++    $vlcArgs += @('--scene-format=png','--scene-ratio=25',
++        '--scene-prefix=easycap','--scene-replace',"--scene-path=$frames")
++}
++# Reference-based display correction (Kirby real hardware / RetroArch comparison). Recorded TS retains input colors.
++$displayFilters = @()
++if ($Preview -and $Denoise -and -not $NoDenoise) {
++    $displayFilters += 'hqdn3d'
++    # Spatial smoothing reduces diagonal interference without temporal ghosting.
++    $vlcArgs += @('--hqdn3d-luma-spat=6','--hqdn3d-chroma-spat=4',
++        '--hqdn3d-luma-temp=0','--hqdn3d-chroma-temp=0')
++}
++if ($Preview -and $EnhanceColor -and -not $NaturalColor) {
++    $displayFilters += 'adjust'
++    $culture = [Globalization.CultureInfo]::InvariantCulture
++    $vlcArgs += @("--saturation=$($Saturation.ToString($culture))", "--contrast=$($Contrast.ToString($culture))",
++        "--brightness=$($Brightness.ToString($culture))", "--gamma=$($Gamma.ToString($culture))", "--hue=$($Hue.ToString($culture))")
++}
++if ($takeSnapshots) { $displayFilters += 'scene' }
++if ($displayFilters.Count -gt 0) { $vlcArgs += "--video-filter=$($displayFilters -join ':')" }
++if ($Preview) {
++    $vlcArgs += @('--meta-title=EasyCAP','--no-fullscreen','--no-qt-video-autoresize',
++        '--width=480','--height=360','--zoom=0.666667','--audio')
++} else {
++    $vlcArgs += @('-I','dummy','--vout=dummy',"--run-time=$Seconds")
++    if (-not $RecordingPath) { $vlcArgs += '--no-audio' }
++}
++if ($Backend -eq 'FFmpeg') {
++    $ffmpeg = Join-Path $PSScriptRoot 'tools\ffmpeg.exe'
++    $bridge = Join-Path $PSScriptRoot 'EasyCAP-Bridge.exe'
++    if (-not (Test-Path -LiteralPath $ffmpeg) -or -not (Test-Path -LiteralPath $bridge)) { throw 'FFmpeg or EasyCAP-Bridge.exe is missing.' }
++    # Arrival-time timestamps stay on the PC clock across console signal loss.
++    # Copy MJPEG without video re-encoding. Count PCM samples for a steady audio clock; do not stretch audio to packet arrival jitter.
++    $ffmpegArgs = @('-hide_banner','-n','-thread_queue_size','64','-rtbufsize','32M',
++        '-use_wallclock_as_timestamps','1','-f','dshow','-video_size','720x480',
++        '-framerate','25','-vcodec','mjpeg','-sample_rate','48000','-sample_size','16','-channels','2',
++        '-i',"video=AV TO USB2.0:audio=$AudioDevice",'-copyts','-start_at_zero',
++        '-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','pcm_s16le',
++        '-af','asetpts=N/SR/TB','-fps_mode','passthrough')
++    if (-not $Preview) { $ffmpegArgs += @('-t',"$Seconds") }
++    $ffmpegArgs += @('-max_interleave_delta','100000','-f','matroska','-live','1',
++        '-cluster_time_limit','100','-flush_packets','1','pipe:1')
++    $vlcArgs += @("--file-caching=$CacheMs",'--play-and-exit','--demux=avformat','--avformat-format=matroska','fd://0')
++    $ffmpegLog = Join-Path $PSScriptRoot "capture-$runId-ffmpeg.log"
++    if ($DryRun) {
++        [pscustomobject]@{ Executable=$vlc; Version=(Get-Item $vlc).VersionInfo.ProductVersion;
++            Arguments=$vlcArgs; Log=$log; FFmpeg=$ffmpeg; FFmpegArguments=$ffmpegArgs;
++            FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath }
++        return
++    }
++    $config = @{ FFmpeg=$ffmpeg; VLC=$vlc; FFmpegArguments=$ffmpegArgs; VLCArguments=$vlcArgs;
++        FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath }
++    $configFile = Join-Path ([IO.Path]::GetTempPath()) "easycap-bridge-$runId.json"
++    try {
++        [IO.File]::WriteAllText($configFile,($config | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
++        Write-Host "EasyCAP: FFmpeg wall clock capture; VLC display. Log: $ffmpegLog"
++        if ($RecordingPath) { Write-Host "Recording: $RecordingPath" }
++        & $bridge $configFile | Out-Null
++        if ($LASTEXITCODE -ne 0) { throw "EasyCAP capture failed. See $ffmpegLog" }
++    } finally {
++        if (Test-Path -LiteralPath $configFile) { Remove-Item -LiteralPath $configFile }
++    }
++    if ($RecordingPath) {
++        $recording = Get-Item -LiteralPath $RecordingPath -ErrorAction SilentlyContinue
++        if (-not $recording -or $recording.Length -eq 0) { throw "No recording produced. See $ffmpegLog" }
++        $recording | Select-Object FullName,LastWriteTime,Length
++    }
++    return
++}
++if ($RecordingPath) {
++    $recordTarget = $RecordingPath.Replace('\','/')
++    # TS carries explicit timestamps; avoid the AVI negative-length failure path.
++    # Decode once for recording; preview branches before the encoder.
++    $fileChain = "transcode{vcodec=mp2v,vb=6000,acodec=mpga,ab=192,channels=2,samplerate=48000}:std{access=file,mux=ts,dst='$recordTarget'}"
++    if ($Preview) { $sout = "#duplicate{dst=display,dst=`"$fileChain`"}" }
++    else { $sout = "#$fileChain" }
++    $vlcArgs += @('--sout',$sout,'--sout-mux-caching=300')
++}
++$vlcArgs += @('dshow://',':dshow-vdev=AV TO USB2.0',":dshow-adev=$AudioDevice",
++    ':dshow-size=720x480',':dshow-aspect-ratio=4:3',
++    ':dshow-audio-samplerate=48000',':dshow-audio-bitspersample=16',':dshow-audio-channels=2')
++# Let the driver negotiate FPS: the old log reports 25fps, so do not force 29.97.
+ if (-not $Preview) { $vlcArgs += 'vlc://quit' }
+-if ($RecordingPath) {
+-    if (-not $Preview) { throw 'Recording requires -Preview.' }
+-    if (Test-Path -LiteralPath $RecordingPath) { throw 'Recording file already exists.' }
+-    New-Item -ItemType Directory -Force (Split-Path -Parent $RecordingPath) | Out-Null
+-    $recordTarget = $RecordingPath.Replace('\','/')
+-    $vlcArgs += @('--sout', "#duplicate{dst=display,dst=std{access=file,mux=avi,dst=$recordTarget}}", '--sout-keep')
++if ($DryRun) {
++    [pscustomobject]@{ Executable=$vlc; Version=(Get-Item $vlc).VersionInfo.ProductVersion; Arguments=$vlcArgs; Log=$log }
++    return
+ }
++Write-Host "VLC: $vlc ($((Get-Item $vlc).VersionInfo.ProductVersion))"
++Write-Host "EasyCAP audio input: $AudioDevice; cache: ${CacheMs}ms; log: $log"
+ $captureStarted = Get-Date
+ & $vlc @vlcArgs | Out-Null
+-if (-not $Preview) {
+-    $captureDeadline = (Get-Date).AddSeconds($Seconds + 15)
+-    do {
+-        Start-Sleep -Milliseconds 500
+-        $frame = Get-Item -LiteralPath (Join-Path $frames 'easycap.png') -ErrorAction SilentlyContinue
+-    } while ((-not $frame -or $frame.LastWriteTime -lt (Get-Date).AddSeconds(-$Seconds)) -and (Get-Date) -lt $captureDeadline)
+-    if (-not $frame -or $frame.LastWriteTime -lt $captureStarted) { throw 'No fresh frame captured. See capture.log.' }
++if ($LASTEXITCODE -ne 0) { throw "VLC exited with code $LASTEXITCODE. See $log" }
++if ($RecordingPath) {
++    $recording = Get-Item -LiteralPath $RecordingPath -ErrorAction SilentlyContinue
++    if (-not $recording -or $recording.Length -eq 0) { throw "No recording produced. See $log" }
++    $recording | Select-Object FullName,LastWriteTime,Length
++}
++if (-not $Preview -and $takeSnapshots) {
++    $frame = Get-Item -LiteralPath (Join-Path $frames 'easycap.png') -ErrorAction SilentlyContinue
++    if (-not $frame -or $frame.LastWriteTime -lt $captureStarted) { throw "No fresh frame captured. See $log" }
+     $frame | Select-Object FullName,LastWriteTime,Length
+-}
+-
+-
+-
+-
+-
+-
+-
+-
++}
+\ No newline at end of file
+--- /dev/null
++++ b/Open-EasyCAP.cs
+@@ -0,0 +1,52 @@
++﻿using System;
++using System.Diagnostics;
++using System.IO;
++using System.Reflection;
++using System.Text;
++using System.Windows.Forms;
++[assembly: AssemblyTitle("EasyCAP Launcher")]
++[assembly: AssemblyVersion("1.0.0.0")]
++internal static class Program
++{
++    [STAThread]
++    private static int Main(string[] args)
++    {
++        string folder = AppDomain.CurrentDomain.BaseDirectory;
++        string script = Path.Combine(folder, "Capture-EasyCAP.ps1");
++        try
++        {
++            if (!File.Exists(script)) throw new FileNotFoundException("Capture-EasyCAP.ps1 が見つかりません。EXEをEasy_CAPtureフォルダーに置いてください。", script);
++            string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
++            if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell が見つかりません。", powershell);
++            if (args.Length == 1 && args[0] == "--check") return 0;
++            var info = new ProcessStartInfo(powershell);
++            string extra = " -Preview";
++            if (Path.GetFileNameWithoutExtension(Application.ExecutablePath).Equals("Record-EasyCAP", StringComparison.OrdinalIgnoreCase) || (args.Length == 1 && args[0] == "--record"))
++            {
++                string captures = Path.Combine(folder, "recordings");
++                Directory.CreateDirectory(captures);
++                string output = Path.Combine(captures, "EasyCAP-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + ".mkv");
++                extra += " -RecordingPath \"" + output + "\"";
++            }
++            info.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\"" + extra;
++            info.WorkingDirectory = folder;
++            info.UseShellExecute = false;
++            info.CreateNoWindow = true;
++            info.RedirectStandardError = true;
++            info.StandardErrorEncoding = Encoding.UTF8;
++            using (var process = Process.Start(info))
++            {
++                string error = process.StandardError.ReadToEnd();
++                process.WaitForExit();
++                if (process.ExitCode != 0)
++                    throw new Exception("EasyCAPを起動できませんでした。接続と音声入力を確認してください。\r\n\r\n" + error);
++            }
++            return 0;
++        }
++        catch (Exception ex)
++        {
++            MessageBox.Show(ex.Message, "EasyCAP", MessageBoxButtons.OK, MessageBoxIcon.Error);
++            return 1;
++        }
++    }
++}
+\ No newline at end of file
+--- /dev/null
++++ b/EasyCAP-Bridge.cs
+@@ -0,0 +1,74 @@
++﻿using System;
++using System.IO;
++using System.Text;
++using System.Linq;
++using System.Diagnostics;
++using System.Threading;
++using System.Threading.Tasks;
++using System.Web.Script.Serialization;
++using System.Collections.Generic;
++public sealed class BridgeConfig {
++ public string FFmpeg {get;set;} public string VLC {get;set;}
++ public string[] FFmpegArguments {get;set;} public string[] VLCArguments {get;set;}
++ public string FFmpegLog {get;set;} public string RecordingPath {get;set;}
++}
++internal static class EasyCAPBridge {
++ // Windows CommandLineToArgvW-compatible quoting, including embedded quotes.
++ static string Quote(string s) {
++  var b=new StringBuilder("\""); int slashes=0;
++  foreach(char c in s) { if(c=='\\'){slashes++;continue;} if(c=='\"'){b.Append('\\',slashes*2+1);b.Append(c);}else{b.Append('\\',slashes);b.Append(c);}slashes=0; }
++  b.Append('\\',slashes*2);b.Append('"');return b.ToString();
++ }
++ static ProcessStartInfo Info(string exe,string[] args) {
++  return new ProcessStartInfo(exe,string.Join(" ",args.Select(Quote).ToArray())){UseShellExecute=false,CreateNoWindow=true};
++ }
++ static void StopFFmpeg(Process p) {
++  if(p==null||p.HasExited)return;
++  try{p.StandardInput.WriteLine("q");p.StandardInput.Flush();}catch{}
++  if(!p.WaitForExit(5000)){p.Kill();p.WaitForExit();}
++ }
++ static void FinalizeRecording(BridgeConfig c,StreamWriter log) {
++  if(string.IsNullOrEmpty(c.RecordingPath)||!File.Exists(c.RecordingPath))return;
++  string temp=c.RecordingPath+".finalizing-"+Guid.NewGuid().ToString("N")+".mkv";
++  try{
++   var info=Info(c.FFmpeg,new[]{"-hide_banner","-nostdin","-v","error","-n","-i",c.RecordingPath,"-map","0","-c","copy",temp});
++   info.RedirectStandardError=true;
++   using(var p=Process.Start(info)){string error=p.StandardError.ReadToEnd();p.WaitForExit();if(p.ExitCode!=0)throw new IOException(error);}
++   // The destination was created exclusively by this capture; replace only after a complete remux.
++   File.Replace(temp,c.RecordingPath,null);
++   log.WriteLine("Recording finalized with duration and seek index: "+c.RecordingPath);
++  }catch(Exception e){log.WriteLine("Recording kept in playable live Matroska form; index finalization failed: "+e.Message);}
++ }
++ static int Main(string[] args) {
++  Process ff=null,vlc=null;FileStream recording=null;StreamWriter log=null;
++  try {
++   if(args.Length!=1)throw new ArgumentException("Expected bridge configuration path.");
++   var c=new JavaScriptSerializer().Deserialize<BridgeConfig>(File.ReadAllText(args[0],Encoding.UTF8));
++   log=new StreamWriter(c.FFmpegLog,false,new UTF8Encoding(false));log.AutoFlush=true;
++   if(!string.IsNullOrEmpty(c.RecordingPath))recording=new FileStream(c.RecordingPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);
++   var vi=Info(c.VLC,c.VLCArguments);vi.RedirectStandardInput=true;
++   vlc=Process.Start(vi);
++   var fi=Info(c.FFmpeg,c.FFmpegArguments);fi.RedirectStandardInput=true;fi.RedirectStandardOutput=true;fi.RedirectStandardError=true;
++   ff=Process.Start(fi);
++   var logger=log;
++   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null)logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);});
++   var source=ff.StandardOutput.BaseStream;var dest=vlc.StandardInput.BaseStream;var saved=recording;
++   Task pump=Task.Run(()=>{
++    byte[] buffer=new byte[65536];int n;bool displayOpen=true;
++    try{while((n=source.Read(buffer,0,buffer.Length))>0){if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
++    finally{try{dest.Close();}catch{}}
++   });
++   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted)Thread.Sleep(100);
++   bool closedByUser=vlc.HasExited;
++   if(closedByUser||pump.IsFaulted)StopFFmpeg(ff);
++   if(!ff.HasExited&&!ff.WaitForExit(5000))StopFFmpeg(ff);
++   pump.GetAwaiter().GetResult();errors.GetAwaiter().GetResult();
++   if(recording!=null){recording.Flush(true);recording.Dispose();recording=null;}
++   if(!vlc.HasExited&&!vlc.WaitForExit(10000)){vlc.CloseMainWindow();if(!vlc.WaitForExit(3000))vlc.Kill();}
++   if(ff.ExitCode!=0&&!closedByUser)throw new Exception("FFmpeg capture failed ("+ff.ExitCode+"). See "+c.FFmpegLog);
++   FinalizeRecording(c,log);
++   return 0;
++  }catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
++  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();}
++ }
++}
+--- /dev/null
++++ b/Build-EasyCAP.ps1
+@@ -0,0 +1,13 @@
++param()
++$ErrorActionPreference = 'Stop'
++$compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
++if (-not (Test-Path -LiteralPath $compiler)) { throw 'The 64-bit .NET Framework C# compiler was not found.' }
++Push-Location $PSScriptRoot
++try {
++    & $compiler /nologo /target:exe /platform:x64 /reference:System.Web.Extensions.dll /out:EasyCAP-Bridge.exe EasyCAP-Bridge.cs
++    if ($LASTEXITCODE -ne 0) { throw 'Could not build EasyCAP-Bridge.exe. Close EasyCAP before building.' }
++    & $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /out:Open-EasyCAP.exe Open-EasyCAP.cs
++    if ($LASTEXITCODE -ne 0) { throw 'Could not build Open-EasyCAP.exe. Close EasyCAP before building.' }
++    Copy-Item -LiteralPath 'Open-EasyCAP.exe' -Destination 'Record-EasyCAP.exe' -Force
++    Write-Host 'Built Open-EasyCAP.exe, Record-EasyCAP.exe, and EasyCAP-Bridge.exe.'
++} finally { Pop-Location }
+--- /dev/null
++++ b/Record-EasyCAP.cmd
+@@ -0,0 +1,2 @@
++@echo off
++powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Capture-EasyCAP.ps1" -Preview -RecordingPath "%~dp0recordings\EasyCAP-%RANDOM%-%RANDOM%.mkv"
