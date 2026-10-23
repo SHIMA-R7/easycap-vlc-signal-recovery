@@ -4,7 +4,7 @@
     [ValidateRange(1,86400)][int]$Seconds = 6,
     [string]$AudioDevice = '',
     [string]$RecordingPath = '',
-    [ValidateRange(100,3000)][int]$CacheMs = 0,
+    [ValidateRange(30,3000)][int]$CacheMs = 0,
     [switch]$Snapshots,
     [ValidateRange(0,3)][double]$Saturation = 1.25,
     [ValidateRange(0,2)][double]$Contrast = 0.95,
@@ -41,11 +41,11 @@ if (-not $AudioDevice) {
 }
 # VLC 3.0.12 has no dshow-audio-buffer-size option (allocator requests 100ms).
 # Keep clock synchronization enabled. Do not cap jitter during baseline diagnosis.
-if ($CacheMs -eq 0) { if ($RecordingPath) { $CacheMs = 500 } else { $CacheMs = 300 } }
+if ($CacheMs -eq 0) { if ($Backend -eq 'FFmpeg') { $CacheMs = 50 } elseif ($RecordingPath) { $CacheMs = 500 } else { $CacheMs = 300 } }
 if ($RecordingPath) {
     $RecordingPath = [IO.Path]::GetFullPath($RecordingPath)
     $extension = [IO.Path]::GetExtension($RecordingPath)
-    if ($Backend -eq 'FFmpeg' -and $extension -ne '.mkv') { throw 'FFmpeg capture requires a .mkv recording path (original MJPEG video / PCM audio).' }
+    if ($Backend -eq 'FFmpeg' -and $extension -ne '.mkv') { throw 'FFmpeg capture requires a .mkv recording path (MJPEG video / PCM audio).' }
     if ($Backend -eq 'DirectShow' -and $extension -ne '.ts') { throw 'DirectShow recording requires a .ts recording path.' }
     if ($RecordingPath.Contains("'")) { throw 'Recording path must not contain an apostrophe.' }
     if (Test-Path -LiteralPath $RecordingPath) { throw 'Recording file already exists.' }
@@ -92,18 +92,19 @@ if ($Backend -eq 'FFmpeg') {
     $ffmpeg = Join-Path $PSScriptRoot 'tools\ffmpeg.exe'
     $bridge = Join-Path $PSScriptRoot 'EasyCAP-Bridge.exe'
     if (-not (Test-Path -LiteralPath $ffmpeg) -or -not (Test-Path -LiteralPath $bridge)) { throw 'FFmpeg or EasyCAP-Bridge.exe is missing.' }
-    # Arrival-time timestamps stay on the PC clock across console signal loss.
-    # Copy MJPEG without video re-encoding. Count PCM samples for a steady audio clock; do not stretch audio to packet arrival jitter.
+    # DirectShow graph-clock timestamps stay on the PC clock across console signal loss.
+    # Forward MJPEG and PCM without a video encoder; sample-count audio timestamps avoid pitch modulation.
     $ffmpegArgs = @('-hide_banner','-n','-thread_queue_size','64','-rtbufsize','32M',
-        '-use_wallclock_as_timestamps','1','-f','dshow','-video_size','720x480',
+        '-fflags','+nobuffer','-probesize','65536','-analyzeduration','100000','-fpsprobesize','0',
+        '-f','dshow','-use_video_device_timestamps','0','-audio_buffer_size','20','-video_size','720x480',
         '-framerate','25','-vcodec','mjpeg','-sample_rate','48000','-sample_size','16','-channels','2',
         '-i',"video=AV TO USB2.0:audio=$AudioDevice",'-copyts','-start_at_zero',
         '-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','pcm_s16le',
-        '-af','asetpts=N/SR/TB','-fps_mode','passthrough')
+        '-af','asetpts=STARTPTS+N/SR/TB','-fps_mode','passthrough')
     if (-not $Preview) { $ffmpegArgs += @('-t',"$Seconds") }
-    $ffmpegArgs += @('-max_interleave_delta','100000','-f','matroska','-live','1',
-        '-cluster_time_limit','100','-flush_packets','1','pipe:1')
-    $vlcArgs += @("--file-caching=$CacheMs",'--play-and-exit','--demux=avformat','--avformat-format=matroska','fd://0')
+    $ffmpegArgs += @('-avoid_negative_ts','make_zero','-max_interleave_delta','50000','-f','matroska','-live','1','-cluster_time_limit','40','-flush_packets','1','pipe:1')
+    $vlcArgs += @("--file-caching=$CacheMs","--network-caching=$CacheMs",'--play-and-exit',
+        '--demux=avformat','--avformat-format=matroska','--avformat-options={threads=1}','--avcodec-threads=1','--prefetch-buffer-size=128','--prefetch-read-size=16384','fd://0')
     $ffmpegLog = Join-Path $PSScriptRoot "capture-$runId-ffmpeg.log"
     if ($DryRun) {
         [pscustomobject]@{ Executable=$vlc; Version=(Get-Item $vlc).VersionInfo.ProductVersion;
