@@ -15,6 +15,8 @@
     [switch]$EnhanceColor = $true,
     [switch]$NoDenoise,
     [switch]$NaturalColor,
+    [string]$StopFile = '',
+    [string]$StatusFile = '',
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
@@ -47,7 +49,7 @@ if ($RecordingPath) {
     $extension = [IO.Path]::GetExtension($RecordingPath)
     if ($Backend -eq 'FFmpeg' -and $extension -ne '.mkv') { throw 'FFmpeg capture requires a .mkv recording path (MJPEG video / PCM audio).' }
     if ($Backend -eq 'DirectShow' -and $extension -ne '.ts') { throw 'DirectShow recording requires a .ts recording path.' }
-    if ($RecordingPath.Contains("'")) { throw 'Recording path must not contain an apostrophe.' }
+    if ($Backend -eq 'DirectShow' -and $RecordingPath.Contains("'")) { throw 'DirectShow recording path must not contain an apostrophe.' }
     if (Test-Path -LiteralPath $RecordingPath) { throw 'Recording file already exists.' }
     if (-not $DryRun) { New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($RecordingPath)) | Out-Null }
 }
@@ -57,6 +59,7 @@ $takeSnapshots = $Snapshots -or (-not $Preview -and -not $RecordingPath)
 $runId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), $PID
 $log = Join-Path $PSScriptRoot "capture-$runId.log"
 $vlcArgs = @('--ignore-config','--no-one-instance','--no-qt-updates-notif',
+    '--no-qt-privacy-ask','--no-metadata-network-access',
     "--live-caching=$CacheMs",'--clock-synchro=-1',
     '--audio-time-stretch','--no-video-title-show','--avcodec-hw=none',
     '--verbose=2','--file-logging',"--logfile=$log")
@@ -113,7 +116,7 @@ if ($Backend -eq 'FFmpeg') {
         return
     }
     $config = @{ FFmpeg=$ffmpeg; VLC=$vlc; FFmpegArguments=$ffmpegArgs; VLCArguments=$vlcArgs;
-        FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath }
+        FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath; StopFile=$StopFile; StatusFile=$StatusFile }
     $configFile = Join-Path ([IO.Path]::GetTempPath()) "easycap-bridge-$runId.json"
     try {
         [IO.File]::WriteAllText($configFile,($config | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))

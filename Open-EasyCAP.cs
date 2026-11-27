@@ -19,9 +19,17 @@ internal static class Program
             string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
             if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell が見つかりません。", powershell);
             if (args.Length == 1 && args[0] == "--check") return 0;
+            bool record = Path.GetFileNameWithoutExtension(Application.ExecutablePath).Equals("Record-EasyCAP", StringComparison.OrdinalIgnoreCase) || (args.Length == 1 && args[0] == "--record");
+            if (!record && !(args.Length == 1 && args[0] == "--preview"))
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new CaptureForm(folder));
+                return 0;
+            }
             var info = new ProcessStartInfo(powershell);
             string extra = " -Preview";
-            if (Path.GetFileNameWithoutExtension(Application.ExecutablePath).Equals("Record-EasyCAP", StringComparison.OrdinalIgnoreCase) || (args.Length == 1 && args[0] == "--record"))
+            if (record)
             {
                 string captures = Path.Combine(folder, "recordings");
                 Directory.CreateDirectory(captures);

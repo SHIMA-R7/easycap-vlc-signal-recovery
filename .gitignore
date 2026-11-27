@@ -4,6 +4,7 @@
 !.gitattributes
 !Capture-EasyCAP.ps1
 !Open-EasyCAP.cs
+!EasyCAP-GUI.cs
 !EasyCAP-Bridge.cs
 !Build-EasyCAP.ps1
 !Open-EasyCAP.cmd

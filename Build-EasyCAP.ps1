@@ -6,8 +6,9 @@ Push-Location $PSScriptRoot
 try {
     & $compiler /nologo /target:exe /platform:x64 /reference:System.Web.Extensions.dll /out:EasyCAP-Bridge.exe EasyCAP-Bridge.cs
     if ($LASTEXITCODE -ne 0) { throw 'Could not build EasyCAP-Bridge.exe. Close EasyCAP before building.' }
-    & $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /out:Open-EasyCAP.exe Open-EasyCAP.cs
+    & $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:Open-EasyCAP.exe Open-EasyCAP.cs EasyCAP-GUI.cs
     if ($LASTEXITCODE -ne 0) { throw 'Could not build Open-EasyCAP.exe. Close EasyCAP before building.' }
     Copy-Item -LiteralPath 'Open-EasyCAP.exe' -Destination 'Record-EasyCAP.exe' -Force
-    Write-Host 'Built Open-EasyCAP.exe, Record-EasyCAP.exe, and EasyCAP-Bridge.exe.'
+    Copy-Item -LiteralPath 'Open-EasyCAP.exe' -Destination 'EasyCAP.exe' -Force
+    Write-Host 'Built EasyCAP.exe, Open-EasyCAP.exe, Record-EasyCAP.exe, and EasyCAP-Bridge.exe.'
 } finally { Pop-Location }

@@ -1,6 +1,6 @@
 --- a/Capture-EasyCAP.ps1
 +++ b/Capture-EasyCAP.ps1
-@@ -1,4 +1,22 @@
+@@ -1,4 +1,24 @@
 -﻿param([switch]$Preview, [int]$Seconds = 6, [string]$AudioDevice = '', [string]$RecordingPath = '')
 +﻿param(
 +    [switch]$Preview,
@@ -19,12 +19,14 @@
 +    [switch]$EnhanceColor = $true,
 +    [switch]$NoDenoise,
 +    [switch]$NaturalColor,
++    [string]$StopFile = '',
++    [string]$StatusFile = '',
 +    [switch]$DryRun
 +)
  $ErrorActionPreference = 'Stop'
  $vlcCandidates = @(
      (Join-Path ${env:ProgramFiles(x86)} 'VideoLAN\VLC\vlc.exe'),
-@@ -21,37 +39,128 @@
+@@ -21,37 +41,129 @@
      }
      if (-not $AudioDevice) { throw 'EasyCAP audio input not found. Connect EasyCAP or specify -AudioDevice.' }
  }
@@ -37,7 +39,7 @@
 +    $extension = [IO.Path]::GetExtension($RecordingPath)
 +    if ($Backend -eq 'FFmpeg' -and $extension -ne '.mkv') { throw 'FFmpeg capture requires a .mkv recording path (MJPEG video / PCM audio).' }
 +    if ($Backend -eq 'DirectShow' -and $extension -ne '.ts') { throw 'DirectShow recording requires a .ts recording path.' }
-+    if ($RecordingPath.Contains("'")) { throw 'Recording path must not contain an apostrophe.' }
++    if ($Backend -eq 'DirectShow' -and $RecordingPath.Contains("'")) { throw 'DirectShow recording path must not contain an apostrophe.' }
 +    if (Test-Path -LiteralPath $RecordingPath) { throw 'Recording file already exists.' }
 +    if (-not $DryRun) { New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($RecordingPath)) | Out-Null }
 +}
@@ -52,6 +54,7 @@
 +$runId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), $PID
 +$log = Join-Path $PSScriptRoot "capture-$runId.log"
 +$vlcArgs = @('--ignore-config','--no-one-instance','--no-qt-updates-notif',
++    '--no-qt-privacy-ask','--no-metadata-network-access',
 +    "--live-caching=$CacheMs",'--clock-synchro=-1',
 +    '--audio-time-stretch','--no-video-title-show','--avcodec-hw=none',
 +    '--verbose=2','--file-logging',"--logfile=$log")
@@ -108,7 +111,7 @@
 +        return
 +    }
 +    $config = @{ FFmpeg=$ffmpeg; VLC=$vlc; FFmpegArguments=$ffmpegArgs; VLCArguments=$vlcArgs;
-+        FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath }
++        FFmpegLog=$ffmpegLog; RecordingPath=$RecordingPath; StopFile=$StopFile; StatusFile=$StatusFile }
 +    $configFile = Join-Path ([IO.Path]::GetTempPath()) "easycap-bridge-$runId.json"
 +    try {
 +        [IO.File]::WriteAllText($configFile,($config | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
@@ -171,7 +174,7 @@
 +    $frame = Get-Item -LiteralPath (Join-Path $frames 'easycap.png') -ErrorAction SilentlyContinue
 +    if (-not $frame -or $frame.LastWriteTime -lt $captureStarted) { throw "No fresh frame captured. See $log" }
      $frame | Select-Object FullName,LastWriteTime,Length
--}
+ }
 -
 -
 -
@@ -180,11 +183,9 @@
 -
 -
 -
-+}
-\ No newline at end of file
 --- /dev/null
 +++ b/Open-EasyCAP.cs
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +﻿using System;
 +using System.Diagnostics;
 +using System.IO;
@@ -206,9 +207,17 @@
 +            string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
 +            if (!File.Exists(powershell)) throw new FileNotFoundException("Windows PowerShell が見つかりません。", powershell);
 +            if (args.Length == 1 && args[0] == "--check") return 0;
++            bool record = Path.GetFileNameWithoutExtension(Application.ExecutablePath).Equals("Record-EasyCAP", StringComparison.OrdinalIgnoreCase) || (args.Length == 1 && args[0] == "--record");
++            if (!record && !(args.Length == 1 && args[0] == "--preview"))
++            {
++                Application.EnableVisualStyles();
++                Application.SetCompatibleTextRenderingDefault(false);
++                Application.Run(new CaptureForm(folder));
++                return 0;
++            }
 +            var info = new ProcessStartInfo(powershell);
 +            string extra = " -Preview";
-+            if (Path.GetFileNameWithoutExtension(Application.ExecutablePath).Equals("Record-EasyCAP", StringComparison.OrdinalIgnoreCase) || (args.Length == 1 && args[0] == "--record"))
++            if (record)
 +            {
 +                string captures = Path.Combine(folder, "recordings");
 +                Directory.CreateDirectory(captures);
@@ -237,10 +246,238 @@
 +        }
 +    }
 +}
-\ No newline at end of file
+--- /dev/null
++++ b/EasyCAP-GUI.cs
+@@ -0,0 +1,226 @@
++using System;
++using System.Diagnostics;
++using System.Drawing;
++using System.IO;
++using System.Text;
++using System.Windows.Forms;
++
++internal sealed class CaptureForm : Form
++{
++    readonly string root;
++    readonly string settingsPath;
++    readonly Button preview = new Button(), record = new Button(), stop = new Button();
++    readonly Button browse = new Button(), openFolder = new Button();
++    readonly TextBox folder = new TextBox();
++    readonly CheckBox color = new CheckBox();
++    readonly Label status = new Label(), elapsed = new Label(), fileLabel = new Label(), detail = new Label();
++    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
++    readonly Stopwatch clock = new Stopwatch();
++    readonly StringBuilder output = new StringBuilder();
++    readonly object outputLock = new object();
++    Process capture;
++    string stopFile, statusFile, recordingFile;
++    bool stopping, closeWhenFinished;
++    readonly Color ink = Color.FromArgb(30, 41, 59), muted = Color.FromArgb(91, 106, 127);
++
++    public CaptureForm(string directory) : this(directory, null) { }
++
++    internal CaptureForm(string directory, string settingsOverride)
++    {
++        root = directory;
++        settingsPath = settingsOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EasyCAP", "gui.settings");
++        Text = "EasyCAP";
++        Font = new Font("Yu Gothic UI", 10F);
++        AutoScaleMode = AutoScaleMode.Dpi;
++        AutoScaleDimensions = new SizeF(96F, 96F);
++        ClientSize = new Size(700, 482);
++        MinimumSize = new Size(680, 520);
++        StartPosition = FormStartPosition.CenterScreen;
++        BackColor = Color.FromArgb(244, 247, 251);
++        Icon = SystemIcons.Application;
++
++        var header = new Panel { Dock = DockStyle.Top, Height = 88, BackColor = Color.FromArgb(22, 32, 48) };
++        header.Controls.Add(new Label { Text = "EasyCAP", ForeColor = Color.White, Font = new Font(Font.FontFamily, 22F, FontStyle.Bold), AutoSize = true, Location = new Point(24, 12) });
++        header.Controls.Add(new Label { Text = "プレビューのみ、または録画しながら表示します。", ForeColor = Color.FromArgb(190, 204, 223), AutoSize = true, Location = new Point(27, 56) });
++
++        var body = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24, 18, 24, 14), ColumnCount = 1, RowCount = 8 };
++        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
++        foreach (int height in new[] { 74, 28, 36, 38, 30, 42, 50, 40 }) body.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
++
++        var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
++        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
++        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
++        StyleButton(preview, "プレビュー起動", Color.FromArgb(37, 99, 235));
++        StyleButton(record, "録画して起動", Color.FromArgb(202, 49, 68));
++        preview.Margin = new Padding(0, 0, 8, 8);
++        record.Margin = new Padding(8, 0, 0, 8);
++        actions.Controls.Add(preview, 0, 0); actions.Controls.Add(record, 1, 0);
++        body.Controls.Add(actions, 0, 0);
++        body.Controls.Add(new Label { Text = "録画の保存先", Dock = DockStyle.Fill, ForeColor = ink, TextAlign = ContentAlignment.BottomLeft }, 0, 1);
++
++        var pathRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
++        pathRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); pathRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
++        folder.Dock = DockStyle.Fill; folder.Margin = new Padding(0, 3, 8, 0); folder.AccessibleName = "録画の保存先";
++        folder.Text = Path.Combine(root, "recordings");
++        browse.Text = "変更…"; browse.Dock = DockStyle.Fill; browse.Margin = new Padding(0, 1, 0, 2);
++        pathRow.Controls.Add(folder, 0, 0); pathRow.Controls.Add(browse, 1, 0); body.Controls.Add(pathRow, 0, 2);
++        color.Text = "色補正を使う"; color.Checked = true; color.Dock = DockStyle.Fill; color.ForeColor = ink;
++        body.Controls.Add(color, 0, 3);
++
++        var statusRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
++        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
++        status.Text = "待機中"; status.Dock = DockStyle.Fill; status.Font = new Font(Font, FontStyle.Bold); status.ForeColor = ink;
++        elapsed.Text = "00:00:00"; elapsed.Dock = DockStyle.Fill; elapsed.TextAlign = ContentAlignment.TopRight; elapsed.ForeColor = muted;
++        statusRow.Controls.Add(status, 0, 0); statusRow.Controls.Add(elapsed, 1, 0); body.Controls.Add(statusRow, 0, 4);
++        fileLabel.Text = "録画は日時付きの新しいMKVファイルに保存します。";
++        fileLabel.Dock = DockStyle.Fill; fileLabel.AutoEllipsis = true; fileLabel.ForeColor = muted;
++        body.Controls.Add(fileLabel, 0, 5);
++        detail.Text = "ゲーム機より先に開始すると、起動直後の映像も記録できます。";
++        detail.Dock = DockStyle.Fill; detail.ForeColor = muted;
++        body.Controls.Add(detail, 0, 6);
++
++        var footer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
++        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55)); footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
++        openFolder.Text = "保存先を開く"; openFolder.Dock = DockStyle.Fill; openFolder.Margin = new Padding(0, 0, 12, 0);
++        stop.Text = "停止"; stop.Dock = DockStyle.Fill; stop.Enabled = false; stop.Margin = Padding.Empty;
++        footer.Controls.Add(openFolder, 0, 0); footer.Controls.Add(stop, 1, 0); body.Controls.Add(footer, 0, 7);
++        Controls.Add(body); Controls.Add(header);
++        LoadSettings();
++
++        preview.Click += delegate { StartCapture(false); };
++        record.Click += delegate { StartCapture(true); };
++        stop.Click += delegate { RequestStop(); };
++        browse.Click += delegate {
++            using (var dialog = new FolderBrowserDialog { Description = "録画の保存先を選んでください", SelectedPath = folder.Text, ShowNewFolderButton = true })
++                if (dialog.ShowDialog(this) == DialogResult.OK) { folder.Text = dialog.SelectedPath; SaveSettings(); }
++        };
++        openFolder.Click += delegate {
++            try { string path = Path.GetFullPath(folder.Text.Trim()); Directory.CreateDirectory(path); Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
++            catch (Exception e) { ShowError(e.Message); }
++        };
++        FormClosing += delegate(object sender, FormClosingEventArgs e) {
++            if (capture != null) { e.Cancel = true; closeWhenFinished = true; RequestStop(); }
++        };
++        timer.Interval = 250; timer.Tick += PollCapture; timer.Start();
++    }
++
++    static void StyleButton(Button button, string text, Color background)
++    {
++        button.Text = text; button.Dock = DockStyle.Fill; button.FlatStyle = FlatStyle.Flat;
++        button.FlatAppearance.BorderSize = 0; button.BackColor = background; button.ForeColor = Color.White;
++        button.Font = new Font("Yu Gothic UI", 13F, FontStyle.Bold); button.Cursor = Cursors.Hand;
++    }
++    static string Quote(string value)
++    {
++        var result = new StringBuilder("\""); int slash = 0;
++        foreach (char c in value) {
++            if (c == '\\') { slash++; continue; }
++            result.Append('\\', c == '"' ? slash * 2 + 1 : slash); result.Append(c); slash = 0;
++        }
++        result.Append('\\', slash * 2); return result.Append('"').ToString();
++    }
++    void LoadSettings()
++    {
++        try { string[] values = File.ReadAllLines(settingsPath); if (values.Length > 0 && !string.IsNullOrWhiteSpace(values[0])) folder.Text = values[0]; if (values.Length > 1) color.Checked = values[1] != "False"; }
++        catch (IOException) { } catch (UnauthorizedAccessException) { }
++    }
++    void SaveSettings()
++    {
++        try { Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)); File.WriteAllLines(settingsPath, new[] { folder.Text, color.Checked.ToString() }); }
++        catch (IOException) { } catch (UnauthorizedAccessException) { }
++    }
++    void AppendOutput(string text)
++    {
++        if (text == null) return;
++        lock (outputLock) { output.AppendLine(text); if (output.Length > 16000) output.Remove(0, output.Length - 16000); }
++    }
++    void SetActive(bool active)
++    {
++        preview.Enabled = record.Enabled = browse.Enabled = folder.Enabled = color.Enabled = !active;
++        stop.Enabled = active && !stopping;
++    }
++    void StartCapture(bool save)
++    {
++        if (capture != null) return;
++        try {
++            string script = Path.Combine(root, "Capture-EasyCAP.ps1");
++            if (!File.Exists(script)) throw new FileNotFoundException("Capture-EasyCAP.ps1が見つかりません。EasyCAPフォルダー内で起動してください。");
++            recordingFile = null;
++            if (save) {
++                string path = Path.GetFullPath(folder.Text.Trim()); Directory.CreateDirectory(path); folder.Text = path;
++                recordingFile = Path.Combine(path, "EasyCAP-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + ".mkv");
++            }
++            string session = Path.Combine(Path.GetTempPath(), "easycap-gui-" + Guid.NewGuid().ToString("N"));
++            stopFile = session + ".stop"; statusFile = session + ".status";
++            var args = new StringBuilder("-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ");
++            args.Append(Quote(script)).Append(" -Preview -StopFile ").Append(Quote(stopFile)).Append(" -StatusFile ").Append(Quote(statusFile));
++            if (save) args.Append(" -RecordingPath ").Append(Quote(recordingFile));
++            if (!color.Checked) args.Append(" -NaturalColor");
++            var info = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe"), args.ToString()) {
++                WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
++            };
++            lock (outputLock) output.Clear();
++            var child = new Process { StartInfo = info };
++            child.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { AppendOutput(e.Data); };
++            child.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { AppendOutput(e.Data); };
++            if (!child.Start()) { child.Dispose(); throw new IOException("キャプチャーを起動できませんでした。"); }
++            capture = child; child.BeginOutputReadLine(); child.BeginErrorReadLine();
++            stopping = false; closeWhenFinished = false; clock.Restart(); SaveSettings(); SetActive(true);
++            status.Text = "起動しています…"; status.ForeColor = ink;
++            fileLabel.Text = save ? "保存ファイル：" + recordingFile : "プレビューのみ。録画ファイルは作成しません。";
++            detail.Text = "映像はVLCのウィンドウに表示します。終了は「停止」またはVLCを閉じてください。";
++        }
++        catch (Exception e) { SetActive(false); ShowError(e.Message); }
++    }
++    void RequestStop()
++    {
++        if (capture == null || stopping) return;
++        try {
++            File.WriteAllText(stopFile, "stop"); stopping = true; stop.Enabled = false;
++            status.Text = recordingFile == null ? "停止しています…" : "録画を保存して停止しています…";
++            detail.Text = "ファイルの仕上げが終わるまで、そのままお待ちください。";
++        }
++        catch (Exception e) { closeWhenFinished = false; ShowError("停止の通知に失敗しました。VLCの窓を閉じて終了してください。\n" + e.Message); }
++    }
++    void PollCapture(object sender, EventArgs e)
++    {
++        if (capture == null) return;
++        var duration = clock.Elapsed;
++        elapsed.Text = ((int)duration.TotalHours).ToString("00") + ":" + duration.Minutes.ToString("00") + ":" + duration.Seconds.ToString("00");
++        if (!capture.HasExited) {
++            try {
++                string state = File.ReadAllText(statusFile).Trim();
++                if (!stopping && state == "running") { status.Text = recordingFile == null ? "プレビュー中" : "録画中"; status.ForeColor = recordingFile == null ? Color.FromArgb(22, 110, 70) : Color.FromArgb(190, 40, 60); }
++                if (state == "finalizing") { status.Text = recordingFile == null ? "終了処理中…" : "録画ファイルを仕上げています…"; stop.Enabled = false; }
++            } catch (IOException) { } catch (UnauthorizedAccessException) { }
++            return;
++        }
++        capture.WaitForExit(); int code = capture.ExitCode; capture.Dispose(); capture = null; clock.Stop();
++        DeleteSessionFile(stopFile); DeleteSessionFile(statusFile); stopping = false; SetActive(false);
++        if (code == 0) {
++            status.Text = recordingFile == null ? "停止しました" : "録画を保存しました"; status.ForeColor = ink;
++            detail.Text = recordingFile == null ? "プレビュー起動または録画して起動を選んでください。" : "「保存先を開く」から録画したファイルを確認できます。";
++        } else {
++            string error; lock (outputLock) error = output.ToString();
++            if (error.IndexOf("audio input not found", StringComparison.OrdinalIgnoreCase) >= 0) error = "EasyCAPの音声入力が見つかりません。USB接続を確認してください。";
++            else if (error.IndexOf("already in use", StringComparison.OrdinalIgnoreCase) >= 0) error = "別のEasyCAPキャプチャーが動作しています。先にそちらを停止してください。";
++            ShowError(string.IsNullOrWhiteSpace(error) ? "起動に失敗しました。EasyCAPの接続とcaptureログを確認してください。" : error.Trim());
++        }
++        if (closeWhenFinished) Close();
++    }
++    static void DeleteSessionFile(string path)
++    {
++        if (string.IsNullOrEmpty(path)) return;
++        try { File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { }
++    }
++    void ShowError(string message)
++    {
++        status.Text = "確認が必要です"; status.ForeColor = Color.FromArgb(190, 40, 60);
++        detail.Text = message.Length > 500 ? message.Substring(message.Length - 500) : message;
++    }
++    protected override void Dispose(bool disposing)
++    {
++        if (disposing) { timer.Stop(); timer.Dispose(); }
++        base.Dispose(disposing);
++    }
++}
 --- /dev/null
 +++ b/EasyCAP-Bridge.cs
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,89 @@
 +﻿using System;
 +using System.IO;
 +using System.Text;
@@ -254,8 +491,16 @@
 + public string FFmpeg {get;set;} public string VLC {get;set;}
 + public string[] FFmpegArguments {get;set;} public string[] VLCArguments {get;set;}
 + public string FFmpegLog {get;set;} public string RecordingPath {get;set;}
++ public string StopFile {get;set;} public string StatusFile {get;set;}
 +}
 +internal static class EasyCAPBridge {
++ static bool StopRequested(BridgeConfig c) {
++  return !string.IsNullOrEmpty(c.StopFile)&&File.Exists(c.StopFile);
++ }
++ static void Report(BridgeConfig c,string status) {
++  if(string.IsNullOrEmpty(c.StatusFile))return;
++  try{File.WriteAllText(c.StatusFile,status,new UTF8Encoding(false));}catch(IOException){}catch(UnauthorizedAccessException){}
++ }
 + // Windows CommandLineToArgvW-compatible quoting, including embedded quotes.
 + static string Quote(string s) {
 +  var b=new StringBuilder("\""); int slashes=0;
@@ -283,41 +528,48 @@
 +  }catch(Exception e){log.WriteLine("Recording kept in playable live Matroska form; index finalization failed: "+e.Message);}
 + }
 + static int Main(string[] args) {
-+  Process ff=null,vlc=null;FileStream recording=null;StreamWriter log=null;
++  Process ff=null,vlc=null;FileStream recording=null;StreamWriter log=null;Mutex deviceLock=null;bool ownsDevice=false;BridgeConfig c=null;
 +  try {
 +   if(args.Length!=1)throw new ArgumentException("Expected bridge configuration path.");
-+   var c=new JavaScriptSerializer().Deserialize<BridgeConfig>(File.ReadAllText(args[0],Encoding.UTF8));
++   c=new JavaScriptSerializer().Deserialize<BridgeConfig>(File.ReadAllText(args[0],Encoding.UTF8));
++   deviceLock=new Mutex(false,@"Local\EasyCAP-Capture-Device");
++   try{ownsDevice=deviceLock.WaitOne(0);}catch(AbandonedMutexException){ownsDevice=true;}
++   if(!ownsDevice)throw new Exception("EasyCAP is already in use. Close the other EasyCAP capture first.");
++   Report(c,"starting");
 +   log=new StreamWriter(c.FFmpegLog,false,new UTF8Encoding(false));log.AutoFlush=true;
 +   if(!string.IsNullOrEmpty(c.RecordingPath))recording=new FileStream(c.RecordingPath,FileMode.CreateNew,FileAccess.Write,FileShare.Read);
 +   var vi=Info(c.VLC,c.VLCArguments);vi.RedirectStandardInput=true;
 +   vlc=Process.Start(vi);
-+   var fi=Info(c.FFmpeg,c.FFmpegArguments);fi.RedirectStandardInput=true;fi.RedirectStandardOutput=true;fi.RedirectStandardError=true;
++   var fi=Info(c.FFmpeg,c.FFmpegArguments);fi.RedirectStandardInput=true;fi.RedirectStandardOutput=true;fi.RedirectStandardError=true;fi.StandardErrorEncoding=Encoding.UTF8;
 +   ff=Process.Start(fi);
 +   var logger=log;
 +   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null)logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);});
 +   var source=ff.StandardOutput.BaseStream;var dest=vlc.StandardInput.BaseStream;var saved=recording;
 +   Task pump=Task.Run(()=>{
-+    byte[] buffer=new byte[65536];int n;bool displayOpen=true;
-+    try{while((n=source.Read(buffer,0,buffer.Length))>0){if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
++    byte[] buffer=new byte[65536];int n;bool displayOpen=true,reported=false;
++    try{while((n=source.Read(buffer,0,buffer.Length))>0){if(!reported){Report(c,"running");reported=true;}if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
 +    finally{try{dest.Close();}catch{}}
 +   });
-+   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted)Thread.Sleep(100);
++   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted&&!StopRequested(c))Thread.Sleep(100);
 +   bool closedByUser=vlc.HasExited;
-+   if(closedByUser||pump.IsFaulted)StopFFmpeg(ff);
++   bool requestedStop=StopRequested(c);
++   if(closedByUser||pump.IsFaulted||requestedStop){Report(c,"stopping");StopFFmpeg(ff);}
 +   if(!ff.HasExited&&!ff.WaitForExit(5000))StopFFmpeg(ff);
 +   pump.GetAwaiter().GetResult();errors.GetAwaiter().GetResult();
 +   if(recording!=null){recording.Flush(true);recording.Dispose();recording=null;}
 +   if(!vlc.HasExited&&!vlc.WaitForExit(10000)){vlc.CloseMainWindow();if(!vlc.WaitForExit(3000))vlc.Kill();}
-+   if(ff.ExitCode!=0&&!closedByUser)throw new Exception("FFmpeg capture failed ("+ff.ExitCode+"). See "+c.FFmpegLog);
++   if(ff.ExitCode!=0&&!closedByUser&&!requestedStop)throw new Exception("FFmpeg capture failed ("+ff.ExitCode+"). See "+c.FFmpegLog);
++   Report(c,"finalizing");
 +   FinalizeRecording(c,log);
++   Report(c,"complete");
 +   return 0;
-+  }catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
-+  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();}
++  }catch(Exception e){if(c!=null)Report(c,"error");Console.Error.WriteLine(e.Message);return 1;}
++  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();if(deviceLock!=null){if(ownsDevice)deviceLock.ReleaseMutex();deviceLock.Dispose();}}
 + }
 +}
 --- /dev/null
 +++ b/Build-EasyCAP.ps1
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +param()
 +$ErrorActionPreference = 'Stop'
 +$compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -326,10 +578,11 @@
 +try {
 +    & $compiler /nologo /target:exe /platform:x64 /reference:System.Web.Extensions.dll /out:EasyCAP-Bridge.exe EasyCAP-Bridge.cs
 +    if ($LASTEXITCODE -ne 0) { throw 'Could not build EasyCAP-Bridge.exe. Close EasyCAP before building.' }
-+    & $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /out:Open-EasyCAP.exe Open-EasyCAP.cs
++    & $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:Open-EasyCAP.exe Open-EasyCAP.cs EasyCAP-GUI.cs
 +    if ($LASTEXITCODE -ne 0) { throw 'Could not build Open-EasyCAP.exe. Close EasyCAP before building.' }
 +    Copy-Item -LiteralPath 'Open-EasyCAP.exe' -Destination 'Record-EasyCAP.exe' -Force
-+    Write-Host 'Built Open-EasyCAP.exe, Record-EasyCAP.exe, and EasyCAP-Bridge.exe.'
++    Copy-Item -LiteralPath 'Open-EasyCAP.exe' -Destination 'EasyCAP.exe' -Force
++    Write-Host 'Built EasyCAP.exe, Open-EasyCAP.exe, Record-EasyCAP.exe, and EasyCAP-Bridge.exe.'
 +} finally { Pop-Location }
 --- /dev/null
 +++ b/Record-EasyCAP.cmd
