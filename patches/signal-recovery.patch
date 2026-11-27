@@ -1,6 +1,6 @@
 --- a/Capture-EasyCAP.ps1
 +++ b/Capture-EasyCAP.ps1
-@@ -1,4 +1,24 @@
+@@ -1,4 +1,25 @@
 -﻿param([switch]$Preview, [int]$Seconds = 6, [string]$AudioDevice = '', [string]$RecordingPath = '')
 +﻿param(
 +    [switch]$Preview,
@@ -9,6 +9,7 @@
 +    [string]$AudioDevice = '',
 +    [string]$RecordingPath = '',
 +    [ValidateRange(30,3000)][int]$CacheMs = 0,
++    [ValidateRange(0,500)][int]$AudioBufferMs = 100,
 +    [switch]$Snapshots,
 +    [ValidateRange(0,3)][double]$Saturation = 1.25,
 +    [ValidateRange(0,2)][double]$Contrast = 0.95,
@@ -26,7 +27,7 @@
  $ErrorActionPreference = 'Stop'
  $vlcCandidates = @(
      (Join-Path ${env:ProgramFiles(x86)} 'VideoLAN\VLC\vlc.exe'),
-@@ -21,37 +41,129 @@
+@@ -21,37 +42,129 @@
      }
      if (-not $AudioDevice) { throw 'EasyCAP audio input not found. Connect EasyCAP or specify -AudioDevice.' }
  }
@@ -92,10 +93,10 @@
 +    if (-not (Test-Path -LiteralPath $ffmpeg) -or -not (Test-Path -LiteralPath $bridge)) { throw 'FFmpeg or EasyCAP-Bridge.exe is missing.' }
 +    # DirectShow graph-clock timestamps stay on the PC clock across console signal loss.
 +    # Forward MJPEG and PCM without a video encoder; sample-count audio timestamps avoid pitch modulation.
-+    $ffmpegArgs = @('-hide_banner','-n','-thread_queue_size','64','-rtbufsize','32M',
++    $ffmpegArgs = @('-hide_banner','-n','-nostats','-progress','pipe:2','-stats_period','0.5','-thread_queue_size','64','-rtbufsize','32M',
 +        '-fflags','+nobuffer','-probesize','65536','-analyzeduration','100000','-fpsprobesize','0',
-+        '-f','dshow','-use_video_device_timestamps','0','-audio_buffer_size','20','-video_size','720x480',
-+        '-framerate','25','-vcodec','mjpeg','-sample_rate','48000','-sample_size','16','-channels','2',
++        '-f','dshow','-use_video_device_timestamps','0','-audio_buffer_size',"$AudioBufferMs",'-video_size','720x480',
++        '-framerate','25','-vcodec','mjpeg',
 +        '-i',"video=AV TO USB2.0:audio=$AudioDevice",'-copyts','-start_at_zero',
 +        '-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','pcm_s16le',
 +        '-af','asetpts=STARTPTS+N/SR/TB','-fps_mode','passthrough')
@@ -248,7 +249,7 @@
 +}
 --- /dev/null
 +++ b/EasyCAP-GUI.cs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,239 @@
 +using System;
 +using System.Diagnostics;
 +using System.Drawing;
@@ -271,7 +272,7 @@
 +    readonly object outputLock = new object();
 +    Process capture;
 +    string stopFile, statusFile, recordingFile;
-+    bool stopping, closeWhenFinished;
++    bool stopping, closeWhenFinished, receivedFrames;
 +    readonly Color ink = Color.FromArgb(30, 41, 59), muted = Color.FromArgb(91, 106, 127);
 +
 +    public CaptureForm(string directory) : this(directory, null) { }
@@ -416,7 +417,7 @@
 +            child.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { AppendOutput(e.Data); };
 +            if (!child.Start()) { child.Dispose(); throw new IOException("キャプチャーを起動できませんでした。"); }
 +            capture = child; child.BeginOutputReadLine(); child.BeginErrorReadLine();
-+            stopping = false; closeWhenFinished = false; clock.Restart(); SaveSettings(); SetActive(true);
++            stopping = false; closeWhenFinished = false; receivedFrames = false; clock.Restart(); elapsed.Text = "00:00:00"; SaveSettings(); SetActive(true);
 +            status.Text = "起動しています…"; status.ForeColor = ink;
 +            fileLabel.Text = save ? "保存ファイル：" + recordingFile : "プレビューのみ。録画ファイルは作成しません。";
 +            detail.Text = "映像はVLCのウィンドウに表示します。終了は「停止」またはVLCを閉じてください。";
@@ -440,21 +441,34 @@
 +        elapsed.Text = ((int)duration.TotalHours).ToString("00") + ":" + duration.Minutes.ToString("00") + ":" + duration.Seconds.ToString("00");
 +        if (!capture.HasExited) {
 +            try {
-+                string state = File.ReadAllText(statusFile).Trim();
-+                if (!stopping && state == "running") { status.Text = recordingFile == null ? "プレビュー中" : "録画中"; status.ForeColor = recordingFile == null ? Color.FromArgb(22, 110, 70) : Color.FromArgb(190, 40, 60); }
++                string state;
++                using (var stream = new FileStream(statusFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
++                using (var reader = new StreamReader(stream, Encoding.UTF8)) state = reader.ReadToEnd().Trim();
++                if (!stopping && state == "running") {
++                    receivedFrames = true; status.Text = recordingFile == null ? "プレビュー中" : "録画中"; status.ForeColor = recordingFile == null ? Color.FromArgb(22, 110, 70) : Color.FromArgb(190, 40, 60);
++                    detail.Text = "映像はVLCに表示しています。「停止」またはVLCを閉じて終了できます。";
++                }
++                if (!stopping && state == "waiting") { status.Text = "映像入力を待機中"; status.ForeColor = muted; detail.Text = "まだ映像が進んでいません。機器の接続とゲーム機の電源を確認してください。"; }
++                if (!stopping && state == "stalled") { status.Text = "映像入力が止まっています"; status.ForeColor = Color.FromArgb(170, 100, 0); detail.Text = "復帰を待っています。戻らない場合は停止後にEasyCAPのUSBを差し直してください。"; }
 +                if (state == "finalizing") { status.Text = recordingFile == null ? "終了処理中…" : "録画ファイルを仕上げています…"; stop.Enabled = false; }
 +            } catch (IOException) { } catch (UnauthorizedAccessException) { }
 +            return;
 +        }
 +        capture.WaitForExit(); int code = capture.ExitCode; capture.Dispose(); capture = null; clock.Stop();
-+        DeleteSessionFile(stopFile); DeleteSessionFile(statusFile); stopping = false; SetActive(false);
-+        if (code == 0) {
++        receivedFrames = receivedFrames || File.Exists(statusFile + ".ready");
++        string backendError = ""; try { if (File.Exists(statusFile + ".error")) backendError = File.ReadAllText(statusFile + ".error", Encoding.UTF8); } catch (IOException) { }
++        DeleteSessionFile(stopFile); DeleteSessionFile(statusFile); DeleteSessionFile(statusFile + ".ready"); DeleteSessionFile(statusFile + ".error"); stopping = false; SetActive(false);
++        if (code == 0 && !receivedFrames) {
++            status.Text = "映像が届かないまま停止しました"; status.ForeColor = Color.FromArgb(170, 100, 0);
++            detail.Text = "入力が開始していません。USB接続とゲーム機の電源を確認してください。";
++        } else if (code == 0) {
 +            status.Text = recordingFile == null ? "停止しました" : "録画を保存しました"; status.ForeColor = ink;
 +            detail.Text = recordingFile == null ? "プレビュー起動または録画して起動を選んでください。" : "「保存先を開く」から録画したファイルを確認できます。";
 +        } else {
-+            string error; lock (outputLock) error = output.ToString();
++            string error; lock (outputLock) error = output.ToString(); if (!string.IsNullOrWhiteSpace(backendError)) error = backendError;
 +            if (error.IndexOf("audio input not found", StringComparison.OrdinalIgnoreCase) >= 0) error = "EasyCAPの音声入力が見つかりません。USB接続を確認してください。";
 +            else if (error.IndexOf("already in use", StringComparison.OrdinalIgnoreCase) >= 0) error = "別のEasyCAPキャプチャーが動作しています。先にそちらを停止してください。";
++            else if (error.IndexOf("RenderStream", StringComparison.OrdinalIgnoreCase) >= 0 || error.IndexOf("Error opening input", StringComparison.OrdinalIgnoreCase) >= 0) error = "EasyCAPの取り込みを開始できません。ほかのキャプチャーを閉じ、EasyCAPのUSBを差し直して再試行してください。";
 +            ShowError(string.IsNullOrWhiteSpace(error) ? "起動に失敗しました。EasyCAPの接続とcaptureログを確認してください。" : error.Trim());
 +        }
 +        if (closeWhenFinished) Close();
@@ -477,7 +491,7 @@
 +}
 --- /dev/null
 +++ b/EasyCAP-Bridge.cs
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,111 @@
 +﻿using System;
 +using System.IO;
 +using System.Text;
@@ -500,6 +514,10 @@
 + static void Report(BridgeConfig c,string status) {
 +  if(string.IsNullOrEmpty(c.StatusFile))return;
 +  try{File.WriteAllText(c.StatusFile,status,new UTF8Encoding(false));}catch(IOException){}catch(UnauthorizedAccessException){}
++ }
++ static void ReportDetail(BridgeConfig c,string suffix,string text) {
++  if(string.IsNullOrEmpty(c.StatusFile))return;
++  try{File.WriteAllText(c.StatusFile+suffix,text,new UTF8Encoding(false));}catch(IOException){}catch(UnauthorizedAccessException){}
 + }
 + // Windows CommandLineToArgvW-compatible quoting, including embedded quotes.
 + static string Quote(string s) {
@@ -542,29 +560,47 @@
 +   vlc=Process.Start(vi);
 +   var fi=Info(c.FFmpeg,c.FFmpegArguments);fi.RedirectStandardInput=true;fi.RedirectStandardOutput=true;fi.RedirectStandardError=true;fi.StandardErrorEncoding=Encoding.UTF8;
 +   ff=Process.Start(fi);
-+   var logger=log;
-+   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null)logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);});
++   var logger=log;long frames=0,bytes=0,lastFrameTick=Environment.TickCount;var diagnostic=new StringBuilder();var diagnosticLock=new object();
++   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null){
++    logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);
++    long count;if(line.StartsWith("frame=")&&long.TryParse(line.Substring(6).Trim(),out count)){
++     long previous=Interlocked.Exchange(ref frames,count);if(count>previous)Interlocked.Exchange(ref lastFrameTick,Environment.TickCount);
++    }
++    if(line.IndexOf("error",StringComparison.OrdinalIgnoreCase)>=0||line.IndexOf("Could not",StringComparison.OrdinalIgnoreCase)>=0){lock(diagnosticLock){diagnostic.AppendLine(line);if(diagnostic.Length>1800)diagnostic.Remove(0,diagnostic.Length-1800);}}
++   }});
 +   var source=ff.StandardOutput.BaseStream;var dest=vlc.StandardInput.BaseStream;var saved=recording;
 +   Task pump=Task.Run(()=>{
-+    byte[] buffer=new byte[65536];int n;bool displayOpen=true,reported=false;
-+    try{while((n=source.Read(buffer,0,buffer.Length))>0){if(!reported){Report(c,"running");reported=true;}if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
++    byte[] buffer=new byte[65536];int n;bool displayOpen=true;
++    try{while((n=source.Read(buffer,0,buffer.Length))>0){Interlocked.Add(ref bytes,n);if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
 +    finally{try{dest.Close();}catch{}}
 +   });
-+   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted&&!StopRequested(c))Thread.Sleep(100);
++   string lastState="waiting";bool receivedFrames=false;Report(c,lastState);
++   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted&&!StopRequested(c)){
++    bool ready=Interlocked.Read(ref frames)>=2&&Interlocked.Read(ref bytes)>4096;
++    if(ready&&!receivedFrames){receivedFrames=true;ReportDetail(c,".ready","ready");}
++    string state=receivedFrames?((unchecked((uint)(Environment.TickCount-(int)Interlocked.Read(ref lastFrameTick)))>4000)?"stalled":"running"):"waiting";
++    if(state!=lastState){Report(c,state);lastState=state;}
++    Thread.Sleep(100);
++   }
 +   bool closedByUser=vlc.HasExited;
++   bool ffAlreadyExited=ff.HasExited;
 +   bool requestedStop=StopRequested(c);
 +   if(closedByUser||pump.IsFaulted||requestedStop){Report(c,"stopping");StopFFmpeg(ff);}
 +   if(!ff.HasExited&&!ff.WaitForExit(5000))StopFFmpeg(ff);
 +   pump.GetAwaiter().GetResult();errors.GetAwaiter().GetResult();
++   if(!receivedFrames&&Interlocked.Read(ref frames)>=2&&Interlocked.Read(ref bytes)>4096)ReportDetail(c,".ready","ready");
 +   if(recording!=null){recording.Flush(true);recording.Dispose();recording=null;}
 +   if(!vlc.HasExited&&!vlc.WaitForExit(10000)){vlc.CloseMainWindow();if(!vlc.WaitForExit(3000))vlc.Kill();}
-+   if(ff.ExitCode!=0&&!closedByUser&&!requestedStop)throw new Exception("FFmpeg capture failed ("+ff.ExitCode+"). See "+c.FFmpegLog);
++   if(ff.ExitCode!=0&&!requestedStop&&(ffAlreadyExited||!closedByUser)){
++    string reason;lock(diagnosticLock)reason=diagnostic.ToString();
++    throw new Exception("FFmpeg capture failed ("+ff.ExitCode+").\n"+reason+"Log: "+c.FFmpegLog);
++   }
 +   Report(c,"finalizing");
 +   FinalizeRecording(c,log);
 +   Report(c,"complete");
 +   return 0;
-+  }catch(Exception e){if(c!=null)Report(c,"error");Console.Error.WriteLine(e.Message);return 1;}
-+  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();if(deviceLock!=null){if(ownsDevice)deviceLock.ReleaseMutex();deviceLock.Dispose();}}
++  }catch(Exception e){if(c!=null){ReportDetail(c,".error",e.Message);Report(c,"error");}Console.Error.WriteLine(e.Message);return 1;}
++  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();if(deviceLock!=null){if(ownsDevice){Thread.Sleep(400);deviceLock.ReleaseMutex();}deviceLock.Dispose();}}
 + }
 +}
 --- /dev/null

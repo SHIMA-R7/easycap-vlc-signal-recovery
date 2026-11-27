@@ -5,6 +5,7 @@
     [string]$AudioDevice = '',
     [string]$RecordingPath = '',
     [ValidateRange(30,3000)][int]$CacheMs = 0,
+    [ValidateRange(0,500)][int]$AudioBufferMs = 100,
     [switch]$Snapshots,
     [ValidateRange(0,3)][double]$Saturation = 1.25,
     [ValidateRange(0,2)][double]$Contrast = 0.95,
@@ -97,10 +98,10 @@ if ($Backend -eq 'FFmpeg') {
     if (-not (Test-Path -LiteralPath $ffmpeg) -or -not (Test-Path -LiteralPath $bridge)) { throw 'FFmpeg or EasyCAP-Bridge.exe is missing.' }
     # DirectShow graph-clock timestamps stay on the PC clock across console signal loss.
     # Forward MJPEG and PCM without a video encoder; sample-count audio timestamps avoid pitch modulation.
-    $ffmpegArgs = @('-hide_banner','-n','-thread_queue_size','64','-rtbufsize','32M',
+    $ffmpegArgs = @('-hide_banner','-n','-nostats','-progress','pipe:2','-stats_period','0.5','-thread_queue_size','64','-rtbufsize','32M',
         '-fflags','+nobuffer','-probesize','65536','-analyzeduration','100000','-fpsprobesize','0',
-        '-f','dshow','-use_video_device_timestamps','0','-audio_buffer_size','20','-video_size','720x480',
-        '-framerate','25','-vcodec','mjpeg','-sample_rate','48000','-sample_size','16','-channels','2',
+        '-f','dshow','-use_video_device_timestamps','0','-audio_buffer_size',"$AudioBufferMs",'-video_size','720x480',
+        '-framerate','25','-vcodec','mjpeg',
         '-i',"video=AV TO USB2.0:audio=$AudioDevice",'-copyts','-start_at_zero',
         '-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','pcm_s16le',
         '-af','asetpts=STARTPTS+N/SR/TB','-fps_mode','passthrough')

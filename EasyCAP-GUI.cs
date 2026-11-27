@@ -20,7 +20,7 @@ internal sealed class CaptureForm : Form
     readonly object outputLock = new object();
     Process capture;
     string stopFile, statusFile, recordingFile;
-    bool stopping, closeWhenFinished;
+    bool stopping, closeWhenFinished, receivedFrames;
     readonly Color ink = Color.FromArgb(30, 41, 59), muted = Color.FromArgb(91, 106, 127);
 
     public CaptureForm(string directory) : this(directory, null) { }
@@ -165,7 +165,7 @@ internal sealed class CaptureForm : Form
             child.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) { AppendOutput(e.Data); };
             if (!child.Start()) { child.Dispose(); throw new IOException("キャプチャーを起動できませんでした。"); }
             capture = child; child.BeginOutputReadLine(); child.BeginErrorReadLine();
-            stopping = false; closeWhenFinished = false; clock.Restart(); SaveSettings(); SetActive(true);
+            stopping = false; closeWhenFinished = false; receivedFrames = false; clock.Restart(); elapsed.Text = "00:00:00"; SaveSettings(); SetActive(true);
             status.Text = "起動しています…"; status.ForeColor = ink;
             fileLabel.Text = save ? "保存ファイル：" + recordingFile : "プレビューのみ。録画ファイルは作成しません。";
             detail.Text = "映像はVLCのウィンドウに表示します。終了は「停止」またはVLCを閉じてください。";
@@ -189,21 +189,34 @@ internal sealed class CaptureForm : Form
         elapsed.Text = ((int)duration.TotalHours).ToString("00") + ":" + duration.Minutes.ToString("00") + ":" + duration.Seconds.ToString("00");
         if (!capture.HasExited) {
             try {
-                string state = File.ReadAllText(statusFile).Trim();
-                if (!stopping && state == "running") { status.Text = recordingFile == null ? "プレビュー中" : "録画中"; status.ForeColor = recordingFile == null ? Color.FromArgb(22, 110, 70) : Color.FromArgb(190, 40, 60); }
+                string state;
+                using (var stream = new FileStream(statusFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var reader = new StreamReader(stream, Encoding.UTF8)) state = reader.ReadToEnd().Trim();
+                if (!stopping && state == "running") {
+                    receivedFrames = true; status.Text = recordingFile == null ? "プレビュー中" : "録画中"; status.ForeColor = recordingFile == null ? Color.FromArgb(22, 110, 70) : Color.FromArgb(190, 40, 60);
+                    detail.Text = "映像はVLCに表示しています。「停止」またはVLCを閉じて終了できます。";
+                }
+                if (!stopping && state == "waiting") { status.Text = "映像入力を待機中"; status.ForeColor = muted; detail.Text = "まだ映像が進んでいません。機器の接続とゲーム機の電源を確認してください。"; }
+                if (!stopping && state == "stalled") { status.Text = "映像入力が止まっています"; status.ForeColor = Color.FromArgb(170, 100, 0); detail.Text = "復帰を待っています。戻らない場合は停止後にEasyCAPのUSBを差し直してください。"; }
                 if (state == "finalizing") { status.Text = recordingFile == null ? "終了処理中…" : "録画ファイルを仕上げています…"; stop.Enabled = false; }
             } catch (IOException) { } catch (UnauthorizedAccessException) { }
             return;
         }
         capture.WaitForExit(); int code = capture.ExitCode; capture.Dispose(); capture = null; clock.Stop();
-        DeleteSessionFile(stopFile); DeleteSessionFile(statusFile); stopping = false; SetActive(false);
-        if (code == 0) {
+        receivedFrames = receivedFrames || File.Exists(statusFile + ".ready");
+        string backendError = ""; try { if (File.Exists(statusFile + ".error")) backendError = File.ReadAllText(statusFile + ".error", Encoding.UTF8); } catch (IOException) { }
+        DeleteSessionFile(stopFile); DeleteSessionFile(statusFile); DeleteSessionFile(statusFile + ".ready"); DeleteSessionFile(statusFile + ".error"); stopping = false; SetActive(false);
+        if (code == 0 && !receivedFrames) {
+            status.Text = "映像が届かないまま停止しました"; status.ForeColor = Color.FromArgb(170, 100, 0);
+            detail.Text = "入力が開始していません。USB接続とゲーム機の電源を確認してください。";
+        } else if (code == 0) {
             status.Text = recordingFile == null ? "停止しました" : "録画を保存しました"; status.ForeColor = ink;
             detail.Text = recordingFile == null ? "プレビュー起動または録画して起動を選んでください。" : "「保存先を開く」から録画したファイルを確認できます。";
         } else {
-            string error; lock (outputLock) error = output.ToString();
+            string error; lock (outputLock) error = output.ToString(); if (!string.IsNullOrWhiteSpace(backendError)) error = backendError;
             if (error.IndexOf("audio input not found", StringComparison.OrdinalIgnoreCase) >= 0) error = "EasyCAPの音声入力が見つかりません。USB接続を確認してください。";
             else if (error.IndexOf("already in use", StringComparison.OrdinalIgnoreCase) >= 0) error = "別のEasyCAPキャプチャーが動作しています。先にそちらを停止してください。";
+            else if (error.IndexOf("RenderStream", StringComparison.OrdinalIgnoreCase) >= 0 || error.IndexOf("Error opening input", StringComparison.OrdinalIgnoreCase) >= 0) error = "EasyCAPの取り込みを開始できません。ほかのキャプチャーを閉じ、EasyCAPのUSBを差し直して再試行してください。";
             ShowError(string.IsNullOrWhiteSpace(error) ? "起動に失敗しました。EasyCAPの接続とcaptureログを確認してください。" : error.Trim());
         }
         if (closeWhenFinished) Close();

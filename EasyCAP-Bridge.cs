@@ -21,6 +21,10 @@ internal static class EasyCAPBridge {
   if(string.IsNullOrEmpty(c.StatusFile))return;
   try{File.WriteAllText(c.StatusFile,status,new UTF8Encoding(false));}catch(IOException){}catch(UnauthorizedAccessException){}
  }
+ static void ReportDetail(BridgeConfig c,string suffix,string text) {
+  if(string.IsNullOrEmpty(c.StatusFile))return;
+  try{File.WriteAllText(c.StatusFile+suffix,text,new UTF8Encoding(false));}catch(IOException){}catch(UnauthorizedAccessException){}
+ }
  // Windows CommandLineToArgvW-compatible quoting, including embedded quotes.
  static string Quote(string s) {
   var b=new StringBuilder("\""); int slashes=0;
@@ -62,28 +66,46 @@ internal static class EasyCAPBridge {
    vlc=Process.Start(vi);
    var fi=Info(c.FFmpeg,c.FFmpegArguments);fi.RedirectStandardInput=true;fi.RedirectStandardOutput=true;fi.RedirectStandardError=true;fi.StandardErrorEncoding=Encoding.UTF8;
    ff=Process.Start(fi);
-   var logger=log;
-   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null)logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);});
+   var logger=log;long frames=0,bytes=0,lastFrameTick=Environment.TickCount;var diagnostic=new StringBuilder();var diagnosticLock=new object();
+   Task errors=Task.Run(()=>{string line;while((line=ff.StandardError.ReadLine())!=null){
+    logger.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ")+line);
+    long count;if(line.StartsWith("frame=")&&long.TryParse(line.Substring(6).Trim(),out count)){
+     long previous=Interlocked.Exchange(ref frames,count);if(count>previous)Interlocked.Exchange(ref lastFrameTick,Environment.TickCount);
+    }
+    if(line.IndexOf("error",StringComparison.OrdinalIgnoreCase)>=0||line.IndexOf("Could not",StringComparison.OrdinalIgnoreCase)>=0){lock(diagnosticLock){diagnostic.AppendLine(line);if(diagnostic.Length>1800)diagnostic.Remove(0,diagnostic.Length-1800);}}
+   }});
    var source=ff.StandardOutput.BaseStream;var dest=vlc.StandardInput.BaseStream;var saved=recording;
    Task pump=Task.Run(()=>{
-    byte[] buffer=new byte[65536];int n;bool displayOpen=true,reported=false;
-    try{while((n=source.Read(buffer,0,buffer.Length))>0){if(!reported){Report(c,"running");reported=true;}if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
+    byte[] buffer=new byte[65536];int n;bool displayOpen=true;
+    try{while((n=source.Read(buffer,0,buffer.Length))>0){Interlocked.Add(ref bytes,n);if(saved!=null)saved.Write(buffer,0,n);if(displayOpen){try{dest.Write(buffer,0,n);}catch(IOException){displayOpen=false;}}}}
     finally{try{dest.Close();}catch{}}
    });
-   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted&&!StopRequested(c))Thread.Sleep(100);
+   string lastState="waiting";bool receivedFrames=false;Report(c,lastState);
+   while(!vlc.HasExited&&!ff.HasExited&&!pump.IsCompleted&&!StopRequested(c)){
+    bool ready=Interlocked.Read(ref frames)>=2&&Interlocked.Read(ref bytes)>4096;
+    if(ready&&!receivedFrames){receivedFrames=true;ReportDetail(c,".ready","ready");}
+    string state=receivedFrames?((unchecked((uint)(Environment.TickCount-(int)Interlocked.Read(ref lastFrameTick)))>4000)?"stalled":"running"):"waiting";
+    if(state!=lastState){Report(c,state);lastState=state;}
+    Thread.Sleep(100);
+   }
    bool closedByUser=vlc.HasExited;
+   bool ffAlreadyExited=ff.HasExited;
    bool requestedStop=StopRequested(c);
    if(closedByUser||pump.IsFaulted||requestedStop){Report(c,"stopping");StopFFmpeg(ff);}
    if(!ff.HasExited&&!ff.WaitForExit(5000))StopFFmpeg(ff);
    pump.GetAwaiter().GetResult();errors.GetAwaiter().GetResult();
+   if(!receivedFrames&&Interlocked.Read(ref frames)>=2&&Interlocked.Read(ref bytes)>4096)ReportDetail(c,".ready","ready");
    if(recording!=null){recording.Flush(true);recording.Dispose();recording=null;}
    if(!vlc.HasExited&&!vlc.WaitForExit(10000)){vlc.CloseMainWindow();if(!vlc.WaitForExit(3000))vlc.Kill();}
-   if(ff.ExitCode!=0&&!closedByUser&&!requestedStop)throw new Exception("FFmpeg capture failed ("+ff.ExitCode+"). See "+c.FFmpegLog);
+   if(ff.ExitCode!=0&&!requestedStop&&(ffAlreadyExited||!closedByUser)){
+    string reason;lock(diagnosticLock)reason=diagnostic.ToString();
+    throw new Exception("FFmpeg capture failed ("+ff.ExitCode+").\n"+reason+"Log: "+c.FFmpegLog);
+   }
    Report(c,"finalizing");
    FinalizeRecording(c,log);
    Report(c,"complete");
    return 0;
-  }catch(Exception e){if(c!=null)Report(c,"error");Console.Error.WriteLine(e.Message);return 1;}
-  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();if(deviceLock!=null){if(ownsDevice)deviceLock.ReleaseMutex();deviceLock.Dispose();}}
+  }catch(Exception e){if(c!=null){ReportDetail(c,".error",e.Message);Report(c,"error");}Console.Error.WriteLine(e.Message);return 1;}
+  finally{if(ff!=null){StopFFmpeg(ff);ff.Dispose();}if(vlc!=null){if(!vlc.HasExited){vlc.CloseMainWindow();if(!vlc.WaitForExit(2000))vlc.Kill();}vlc.Dispose();}if(recording!=null)recording.Dispose();if(log!=null)log.Dispose();if(deviceLock!=null){if(ownsDevice){Thread.Sleep(400);deviceLock.ReleaseMutex();}deviceLock.Dispose();}}
  }
 }
